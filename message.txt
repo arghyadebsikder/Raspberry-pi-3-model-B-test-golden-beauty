@@ -1,0 +1,1948 @@
+# Face Scanner with Golden Ratio Analysis — Complete Setup Guide
+
+---
+
+## ⚠️ THINGS TO AVOID — Read This First
+
+**Hardware & Power**
+- Never power the ESP32-CAM from the Raspberry Pi's USB or GPIO 5V pins. The RPi cannot supply enough stable current (ESP32-CAM can spike to 500–800mA). Use a dedicated 5V/2A USB power adapter for the ESP32-CAM via the HW-381 MB's USB port, and a separate quality 5V/3A adapter for the RPi 3.
+- Do not block the ESP32 module's antenna area (the bare PCB end with the small trace antenna) with your hand, metal, or enclosure walls. It will destroy WiFi range.
+- Do not connect the ESP32-CAM to 5GHz WiFi. The ESP32 chip only supports 2.4GHz 802.11 b/g/n.
+
+**ESP32-CAM Flashing**
+- Never upload a sketch without pressing and holding the IO0 button on the HW-381 before pressing RST. If you skip this, you'll get "Failed to connect" errors every time.
+- Do not select the wrong board in Arduino IDE. Must be "AI Thinker ESP32-CAM", not "ESP32 Dev Module" or any other ESP32 board. Using the wrong board definition will produce camera initialization errors.
+- Do not use a USB hub or low-quality cable for flashing. Use a direct USB port on your computer with a known-good data cable.
+- Do not leave `Serial.println` debug spam active in the final sketch. It wastes CPU cycles and the serial buffer adds latency.
+
+**Raspberry Pi & Python**
+- Do not use the system Python directly. Always work inside a virtual environment. Raspberry Pi OS Trixie's system Python is managed by the OS (`python3-*` packages), and pip-installing into it with `--break-system-packages` will eventually cause dependency conflicts.
+- Do not install `opencv-python` (the GUI version with Qt) inside the venv if you are also running Pygame. They both try to initialize display backends and will conflict. Use `opencv-python-headless` in the venv.
+- Do not run `sudo python main.py`. Running Pygame as root is an anti-pattern and can cause SDL2 display errors. Use your normal user account.
+- Do not use `cv2.imshow()` anywhere in the code. Once Pygame has the display, `cv2.imshow` will either crash or show nothing. All display goes through Pygame only.
+- Do not run the application over SSH without exporting `DISPLAY`. If you SSH in and run it without the screen, you will get SDL "no video target" errors.
+
+**MediaPipe on RPi 3**
+- Do not attempt to process face mesh on every single frame without any optimization. RPi 3 B+ has a 1.4GHz ARM Cortex-A53. MediaPipe FaceMesh takes 80–300ms per frame on it. The code below handles this correctly via frame skipping.
+- Do not use `static_image_mode=True` in FaceMesh for live video. It forces full detection on every frame, which is 3–5× slower than tracking mode.
+
+**General**
+- Do not store raw BMP images. They are huge. Use JPEG at 90% quality.
+- Do not set the ESP32-CAM stream resolution above VGA (640×480) for this use case. SVGA and above will make the stream choppy and the Python processing pipeline a bottleneck.
+- Do not expect the golden ratio score to perfectly match academic phi-mask studies. The score is calculated from 5 well-defined facial ratios using pixel-level MediaPipe landmarks, and camera angle, lighting, and distance all affect results. It is a relative indicator, not clinical measurement.
+
+---
+
+## Architecture Overview
+
+The ESP32-CAM runs a lightweight HTTP MJPEG stream server and connects to your WiFi network. The Raspberry Pi reads that MJPEG stream over the local network using Python's `urllib`, decodes each JPEG frame, and passes it to MediaPipe FaceMesh. When a face is detected and held steady, a scanning animation plays, golden ratio analysis runs on the captured frame, results are displayed on the Pygame UI, and the data is saved to an Excel file with the face image on disk.
+
+```
+[ESP32-CAM] --WiFi MJPEG stream--> [RPi stream reader]
+                                         |
+                                    [MediaPipe FaceMesh]
+                                         |
+                              [Golden Ratio Analyzer]
+                             /                       \
+                   [Pygame Renderer]           [Excel + JPEG Storage]
+```
+
+---
+
+## Part 1: Hardware Requirements
+
+**What you need:**
+- Raspberry Pi 3 Model B+ with RPi OS 64-bit Trixie installed (you have this)
+- HW-381 ESP32-CAM MB with AI Thinker ESP32-CAM module (you have this)
+- HDMI display connected to the RPi (minimum 1280×720 recommended)
+- Two separate USB power adapters (5V/3A for RPi, 5V/2A for ESP32-CAM)
+- Both devices on the same 2.4GHz WiFi network
+- A Windows/macOS/Linux PC with Arduino IDE 2.x to flash the ESP32-CAM once
+
+**Camera placement:** Mount the ESP32-CAM at approximately 40–70cm from the subject's face, at eye level. Ensure even, diffuse lighting on the face. Avoid strong backlighting (window behind subject) and direct overhead lighting (creates hard shadows that confuse FaceMesh).
+
+---
+
+## Part 2: ESP32-CAM Firmware
+
+### 2.1 Arduino IDE Setup (on your PC, not the RPi)
+
+1. Download and install Arduino IDE 2.x from `https://www.arduino.cc/en/software`
+2. Open Arduino IDE → File → Preferences
+3. In "Additional boards manager URLs" add:
+   ```
+   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+   ```
+4. Go to Tools → Board → Boards Manager, search "esp32", install **"esp32 by Espressif Systems"** (version 2.x or 3.x)
+
+### 2.2 The Arduino Sketch
+
+Create a new sketch, name it `face_scanner_stream`, paste the entire code below, replace `YOUR_WIFI_SSID` and `YOUR_WIFI_PASSWORD` with your actual credentials:
+
+```cpp
+// face_scanner_stream.ino
+// Optimized MJPEG stream server for AI Thinker ESP32-CAM + HW-381 MB
+
+#include "esp_camera.h"
+#include "esp_http_server.h"
+#include "esp_timer.h"
+#include "img_converters.h"
+#include <WiFi.h>
+
+// ─── WiFi Credentials ────────────────────────────────────────────────────────
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+
+// ─── AI Thinker ESP32-CAM Pin Map ─────────────────────────────────────────────
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ─── MJPEG Stream Constants ───────────────────────────────────────────────────
+#define STREAM_PORT       81
+#define BOUNDARY          "gc0p4Jq0M2Yt08jU534c0p"
+
+static const char* CONTENT_TYPE =
+    "multipart/x-mixed-replace;boundary=" BOUNDARY;
+static const char* FRAME_BOUNDARY = "\r\n--" BOUNDARY "\r\n";
+static const char* FRAME_PART =
+    "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+httpd_handle_t stream_server = NULL;
+
+// ─── Stream Handler ───────────────────────────────────────────────────────────
+static esp_err_t stream_handler(httpd_req_t* req) {
+  camera_fb_t* fb      = NULL;
+  esp_err_t   res      = ESP_OK;
+  uint8_t*    jpg_buf  = NULL;
+  size_t      jpg_len  = 0;
+  char        part_hdr[64];
+
+  httpd_resp_set_type(req, CONTENT_TYPE);
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "X-Framerate", "15");
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("[ERR] Camera capture failed");
+      res = ESP_FAIL;
+      break;
+    }
+
+    if (fb->format != PIXFORMAT_JPEG) {
+      if (!frame2jpg(fb, 80, &jpg_buf, &jpg_len)) {
+        Serial.println("[ERR] JPEG conversion failed");
+        esp_camera_fb_return(fb);
+        res = ESP_FAIL;
+        break;
+      }
+      esp_camera_fb_return(fb);
+      fb = NULL;
+    } else {
+      jpg_buf = fb->buf;
+      jpg_len = fb->len;
+    }
+
+    // Send boundary
+    res = httpd_resp_send_chunk(req, FRAME_BOUNDARY, strlen(FRAME_BOUNDARY));
+    if (res != ESP_OK) break;
+
+    // Send part header
+    size_t hlen = snprintf(part_hdr, sizeof(part_hdr), FRAME_PART, jpg_len);
+    res = httpd_resp_send_chunk(req, part_hdr, hlen);
+    if (res != ESP_OK) break;
+
+    // Send JPEG data
+    res = httpd_resp_send_chunk(req, (const char*)jpg_buf, jpg_len);
+
+    // Cleanup
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = NULL;
+    } else if (jpg_buf) {
+      free(jpg_buf);
+      jpg_buf = NULL;
+    }
+
+    if (res != ESP_OK) break;
+  }
+  return res;
+}
+
+// ─── Setup ───────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n[ESP32-CAM] Face Scanner Stream Server");
+
+  // Camera config
+  camera_config_t cfg;
+  cfg.ledc_channel  = LEDC_CHANNEL_0;
+  cfg.ledc_timer    = LEDC_TIMER_0;
+  cfg.pin_d0        = Y2_GPIO_NUM;
+  cfg.pin_d1        = Y3_GPIO_NUM;
+  cfg.pin_d2        = Y4_GPIO_NUM;
+  cfg.pin_d3        = Y5_GPIO_NUM;
+  cfg.pin_d4        = Y6_GPIO_NUM;
+  cfg.pin_d5        = Y7_GPIO_NUM;
+  cfg.pin_d6        = Y8_GPIO_NUM;
+  cfg.pin_d7        = Y9_GPIO_NUM;
+  cfg.pin_xclk      = XCLK_GPIO_NUM;
+  cfg.pin_pclk      = PCLK_GPIO_NUM;
+  cfg.pin_vsync     = VSYNC_GPIO_NUM;
+  cfg.pin_href      = HREF_GPIO_NUM;
+  cfg.pin_sscb_sda  = SIOD_GPIO_NUM;
+  cfg.pin_sscb_scl  = SIOC_GPIO_NUM;
+  cfg.pin_pwdn      = PWDN_GPIO_NUM;
+  cfg.pin_reset     = RESET_GPIO_NUM;
+  cfg.xclk_freq_hz  = 20000000;
+  cfg.pixel_format  = PIXFORMAT_JPEG;
+  cfg.grab_mode     = CAMERA_GRAB_WHEN_EMPTY;
+  cfg.fb_location   = CAMERA_FB_IN_PSRAM;
+  cfg.frame_size    = FRAMESIZE_VGA;   // 640x480 — best balance for this project
+  cfg.jpeg_quality  = 10;             // 0–63; lower = better quality
+  cfg.fb_count      = 2;
+
+  if (esp_camera_init(&cfg) != ESP_OK) {
+    Serial.println("[ERR] Camera init failed. Check module seating.");
+    return;
+  }
+  Serial.println("[OK] Camera initialized");
+
+  // Tune sensor
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_whitebal(s, 1);       // auto white balance on
+  s->set_awb_gain(s, 1);       // AWB gain on
+  s->set_exposure_ctrl(s, 1);  // auto exposure on
+  s->set_gain_ctrl(s, 1);      // auto gain on
+  s->set_hmirror(s, 0);        // no horizontal mirror (set to 1 if mirrored)
+  s->set_vflip(s, 0);          // no vertical flip
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("[WiFi] Connecting");
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n[ERR] WiFi failed. Check credentials and 2.4GHz band.");
+    return;
+  }
+
+  Serial.printf("\n[OK] WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+
+  // Start stream server on port 81
+  httpd_config_t server_cfg = HTTPD_DEFAULT_CONFIG();
+  server_cfg.server_port    = STREAM_PORT;
+  server_cfg.ctrl_port      = 32769;
+
+  if (httpd_start(&stream_server, &server_cfg) == ESP_OK) {
+    httpd_uri_t uri = {
+      .uri     = "/stream",
+      .method  = HTTP_GET,
+      .handler = stream_handler,
+      .user_ctx = NULL
+    };
+    httpd_register_uri_handler(stream_server, &uri);
+    Serial.printf("[OK] Stream ready: http://%s:%d/stream\n",
+                  WiFi.localIP().toString().c_str(), STREAM_PORT);
+  }
+}
+
+void loop() {
+  delay(30000);  // Nothing to do here; server runs in background tasks
+}
+```
+
+### 2.3 Flashing Procedure
+
+1. Connect HW-381 MB to your PC via USB
+2. In Arduino IDE: Tools → Board → ESP32 Arduino → **AI Thinker ESP32-CAM**
+3. Tools → Port → select the COM port (Windows: `COM3`/etc, Linux: `/dev/ttyUSB0`, Mac: `/dev/cu.usbserial-*`)
+4. Tools → Upload Speed → **115200**
+5. **To enter flash mode:** Press and hold the `IO0` button on the HW-381 MB, then briefly press the `RST` button, then release `IO0`. The serial monitor should show "Waiting for download..."
+6. Click Upload in Arduino IDE
+7. When upload finishes ("Leaving... Hard resetting..."), press `RST` once to boot normally
+8. Open Serial Monitor (Tools → Serial Monitor) at 115200 baud. You'll see the WiFi IP and stream URL
+
+**Write down the stream URL**, for example: `http://192.168.1.105:81/stream`
+
+---
+
+## Part 3: Raspberry Pi Setup
+
+Open a terminal on your RPi. All commands below run on the RPi.
+
+### 3.1 Update the System
+
+```bash
+sudo apt update && sudo apt full-upgrade -y
+sudo apt autoremove -y
+```
+
+### 3.2 Install System Dependencies
+
+```bash
+sudo apt install -y \
+    python3-venv \
+    python3-pip \
+    python3-dev \
+    python3-numpy \
+    libatlas-base-dev \
+    libhdf5-dev \
+    libhdf5-serial-dev \
+    libopenblas-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libtiff-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    libgtk-3-dev \
+    libcanberra-gtk3-module \
+    libxkbcommon0 \
+    libsdl2-dev \
+    libsdl2-image-dev \
+    libsdl2-mixer-dev \
+    libsdl2-ttf-dev \
+    fonts-liberation \
+    wget \
+    git
+```
+
+### 3.3 Create the Project Directory
+
+```bash
+mkdir -p ~/face_scanner/fonts
+mkdir -p ~/face_scanner/data/images
+cd ~/face_scanner
+```
+
+### 3.4 Create and Activate Virtual Environment
+
+```bash
+python3 -m venv venv --system-site-packages
+source venv/bin/activate
+```
+
+### 3.5 Download the Orbitron Font
+
+The UI uses Orbitron (a Google Font with a futuristic monospace style). Run this inside `~/face_scanner/`:
+
+```bash
+wget -q -O fonts/Orbitron-Regular.ttf \
+  "https://github.com/google/fonts/raw/main/ofl/orbitron/static/Orbitron-Regular.ttf"
+
+wget -q -O fonts/Orbitron-Bold.ttf \
+  "https://github.com/google/fonts/raw/main/ofl/orbitron/static/Orbitron-Bold.ttf"
+
+echo "Fonts downloaded."
+ls -lh fonts/
+```
+
+---
+
+## Part 4: Application Code
+
+Create each file inside `~/face_scanner/`. The complete project is 7 Python files.
+
+### 4.1 `requirements.txt`
+
+```
+opencv-python-headless==4.9.0.80
+mediapipe>=0.10.0
+pygame>=2.5.0
+openpyxl>=3.1.0
+numpy>=1.24.0
+```
+
+Install packages:
+
+```bash
+source ~/face_scanner/venv/bin/activate
+pip install --upgrade pip
+pip install -r ~/face_scanner/requirements.txt
+```
+
+This will take 5–15 minutes on RPi 3 as some packages compile from source. Do not interrupt it.
+
+---
+
+### 4.2 `config.py`
+
+```python
+# config.py
+# ─── Central configuration for Face Scanner ───────────────────────────────────
+import os
+
+# ─── ESP32-CAM ────────────────────────────────────────────────────────────────
+# Update this with the IP address shown in Arduino Serial Monitor
+ESP32_IP            = "192.168.1.105"   # <-- CHANGE THIS
+ESP32_STREAM_PORT   = 81
+ESP32_STREAM_URL    = f"http://{ESP32_IP}:{ESP32_STREAM_PORT}/stream"
+STREAM_TIMEOUT_SEC  = 10   # Seconds to wait before declaring stream dead
+
+# ─── Display ──────────────────────────────────────────────────────────────────
+# Will auto-detect screen resolution at startup if set to 0
+DISPLAY_WIDTH   = 0     # 0 = auto-detect
+DISPLAY_HEIGHT  = 0     # 0 = auto-detect
+TARGET_FPS      = 20    # Conservative for RPi 3; raise to 25–30 on RPi 4/5
+
+# ─── Golden Ratio ─────────────────────────────────────────────────────────────
+PHI = 1.618033988749895
+
+# ─── Timing ───────────────────────────────────────────────────────────────────
+FACE_HOLD_SECONDS   = 1.8   # Face must be stable this long before scan triggers
+SCAN_DURATION_SEC   = 2.5   # Duration of the downward scan animation
+RESULT_DISPLAY_SEC  = 8.0   # How long the results screen stays up
+COOLDOWN_SEC        = 4.0   # Minimum gap between captures
+
+# ─── Detection ────────────────────────────────────────────────────────────────
+DETECTION_CONFIDENCE  = 0.70
+TRACKING_CONFIDENCE   = 0.50
+PROCESS_EVERY_N       = 2     # Run MediaPipe on every Nth frame (performance)
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR    = os.path.join(BASE_DIR, "data")
+IMAGES_DIR  = os.path.join(DATA_DIR, "images")
+EXCEL_FILE  = os.path.join(DATA_DIR, "face_scans.xlsx")
+FONT_DIR    = os.path.join(BASE_DIR, "fonts")
+
+# ─── Color Palette (R, G, B) ──────────────────────────────────────────────────
+C_BG            = (6,   8,  18)    # Deep space background
+C_PANEL_BG      = (8,  12,  28)    # Side panel background
+C_CYAN          = (0, 210, 255)    # Primary accent / face mesh
+C_CYAN_DIM      = (0,  55,  80)    # Dim cyan for backgrounds
+C_CYAN_MID      = (0, 110, 160)    # Mid cyan
+C_GOLD          = (255, 196,  40)  # Golden ratio accent
+C_GOLD_DIM      = (100,  75,   8)  # Dim gold
+C_WHITE         = (215, 235, 255)  # Soft white for text
+C_GREEN         = (0,  230, 110)   # High score
+C_AMBER         = (255, 160,  20)  # Medium score
+C_RED           = (255,  55,  55)  # Low score
+C_GRID          = (0,   28,  45)   # Subtle background grid
+C_SEPARATOR     = (0,   45,  70)   # Panel separator line
+```
+
+---
+
+### 4.3 `stream.py`
+
+```python
+# stream.py
+# ─── Background thread that reads the ESP32-CAM MJPEG stream ──────────────────
+
+import urllib.request
+import threading
+import time
+import numpy as np
+import cv2
+import logging
+
+log = logging.getLogger("stream")
+
+
+class ESP32Stream:
+    """
+    Reads a MJPEG stream from the ESP32-CAM in a daemon thread.
+    Thread-safe; call read() from the main thread at any time.
+    """
+
+    def __init__(self, url: str, reconnect_delay: float = 3.0):
+        self.url              = url
+        self.reconnect_delay  = reconnect_delay
+
+        self._frame           = None
+        self._lock            = threading.Lock()
+        self._running         = False
+        self._thread          = None
+        self._last_frame_time = 0.0
+        self._frame_count     = 0
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def start(self):
+        """Start the background capture thread."""
+        self._running = True
+        self._thread  = threading.Thread(target=self._loop, daemon=True,
+                                         name="esp32-stream")
+        self._thread.start()
+        log.info("Stream thread started: %s", self.url)
+
+    def stop(self):
+        """Signal the thread to stop."""
+        self._running = False
+
+    def read(self):
+        """
+        Returns (success: bool, frame: np.ndarray | None).
+        A frame is considered stale if older than 3 seconds.
+        """
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            age = time.monotonic() - self._last_frame_time
+            if age > 3.0:
+                return False, None
+            return True, self._frame.copy()
+
+    @property
+    def is_alive(self) -> bool:
+        with self._lock:
+            return (self._frame is not None and
+                    time.monotonic() - self._last_frame_time < 3.0)
+
+    # ── Private ───────────────────────────────────────────────────────────────
+
+    def _loop(self):
+        while self._running:
+            try:
+                self._read_stream()
+            except Exception as exc:
+                log.warning("Stream error: %s — retrying in %.1fs",
+                            exc, self.reconnect_delay)
+                if self._running:
+                    time.sleep(self.reconnect_delay)
+
+    def _read_stream(self):
+        req = urllib.request.urlopen(self.url, timeout=10)
+        buf = b""
+
+        while self._running:
+            chunk = req.read(8192)
+            if not chunk:
+                break
+            buf += chunk
+
+            # Locate complete JPEG within the MJPEG boundary stream
+            while True:
+                start = buf.find(b"\xff\xd8")
+                end   = buf.find(b"\xff\xd9")
+                if start < 0 or end < 0 or end <= start:
+                    break
+
+                jpg = buf[start: end + 2]
+                buf = buf[end + 2:]
+
+                frame = cv2.imdecode(
+                    np.frombuffer(jpg, dtype=np.uint8),
+                    cv2.IMREAD_COLOR
+                )
+                if frame is not None:
+                    with self._lock:
+                        self._frame           = frame
+                        self._last_frame_time = time.monotonic()
+                        self._frame_count    += 1
+```
+
+---
+
+### 4.4 `detector.py`
+
+```python
+# detector.py
+# ─── MediaPipe FaceMesh wrapper ───────────────────────────────────────────────
+
+import mediapipe as mp
+import cv2
+import logging
+
+log = logging.getLogger("detector")
+
+_mp_fm = mp.solutions.face_mesh
+
+# ─── Key landmark indices (MediaPipe FaceMesh, 468 + 10 iris with refine=True)
+LM = {
+    "forehead":        10,
+    "chin":           152,
+    "left_cheek":     234,
+    "right_cheek":    454,
+    "left_eye_outer":  33,
+    "right_eye_outer":263,
+    "left_eye_inner": 133,
+    "right_eye_inner":362,
+    "nose_tip":         4,
+    "nose_bottom":     94,
+    "nose_bridge":    168,
+    "left_nostril":   129,
+    "right_nostril":  358,
+    "mouth_left":      61,
+    "mouth_right":    291,
+    "upper_lip":        0,
+    "lower_lip":       17,
+}
+
+# ─── Which connection sets to draw ────────────────────────────────────────────
+# Use CONTOURS (134 connections) for performance; TESSELATION has 756.
+try:
+    DRAW_CONNECTIONS = _mp_fm.FACEMESH_CONTOURS
+    IRIS_CONNECTIONS = _mp_fm.FACEMESH_IRISES
+except AttributeError:
+    DRAW_CONNECTIONS = frozenset()
+    IRIS_CONNECTIONS = frozenset()
+    log.warning("FACEMESH_CONTOURS not found in this MediaPipe version.")
+
+
+class FaceDetector:
+
+    def __init__(self, detection_conf: float = 0.70,
+                 tracking_conf: float = 0.50):
+        self._mesh = _mp_fm.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,       # adds iris landmarks
+            min_detection_confidence=detection_conf,
+            min_tracking_confidence=tracking_conf,
+        )
+        log.info("FaceDetector ready (detection=%.2f, tracking=%.2f)",
+                 detection_conf, tracking_conf)
+
+    def process(self, frame):
+        """
+        Process a BGR frame.
+
+        Returns a dict:
+          face_detected : bool
+          landmarks     : list of landmark objects (or None)
+          bbox          : (x1, y1, x2, y2) pixel coords with margin (or None)
+          img_w, img_h  : original frame dimensions
+        """
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        results = self._mesh.process(rgb)
+
+        if not results.multi_face_landmarks:
+            return dict(face_detected=False, landmarks=None,
+                        bbox=None, img_w=w, img_h=h)
+
+        lms = results.multi_face_landmarks[0].landmark
+
+        # Bounding box with 8% margin
+        xs = [lm.x * w for lm in lms]
+        ys = [lm.y * h for lm in lms]
+        mx, my = w * 0.08, h * 0.08
+        x1 = max(0,   int(min(xs) - mx))
+        y1 = max(0,   int(min(ys) - my))
+        x2 = min(w,   int(max(xs) + mx))
+        y2 = min(h,   int(max(ys) + my))
+
+        return dict(
+            face_detected=True,
+            landmarks=lms,
+            bbox=(x1, y1, x2, y2),
+            img_w=w,
+            img_h=h,
+        )
+
+    def get_pt(self, lms, name: str, img_w: int, img_h: int):
+        """Return (x, y) pixel coordinates for a named landmark."""
+        idx = LM.get(name)
+        if idx is None or idx >= len(lms):
+            return None
+        lm = lms[idx]
+        return (lm.x * img_w, lm.y * img_h)
+
+    def close(self):
+        self._mesh.close()
+```
+
+---
+
+### 4.5 `analyzer.py`
+
+```python
+# analyzer.py
+# ─── Golden Ratio facial analysis ─────────────────────────────────────────────
+#
+# Uses 5 measurements that are supported by the phi-mask literature.
+# Each measurement produces a value that is compared to φ (1.618...).
+# Score formula: higher = closer to golden ratio, capped at 100%.
+
+import math
+from config import PHI
+from detector import LM
+
+
+def _dist(p1, p2) -> float:
+    if p1 is None or p2 is None:
+        return 0.0
+    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+
+
+def _ratio_score(ratio: float) -> float:
+    """
+    Returns 0–100 indicating how close `ratio` is to PHI.
+    - 100  = exact golden ratio
+    - ~90  = within 5% of phi
+    - ~75  = within 15% of phi
+    -   0  = deviation ≥ phi from phi
+    """
+    if ratio <= 0:
+        return 0.0
+    deviation = abs(ratio - PHI) / PHI          # normalised deviation
+    score = max(0.0, (1.0 - deviation) * 100.0) # linear penalty
+    return round(score, 2)
+
+
+def analyze(landmarks, img_w: int, img_h: int) -> dict:
+    """
+    Run golden ratio analysis on MediaPipe face landmarks.
+
+    Returns:
+        overall_score     : float (0–100)
+        individual_scores : {name: score}
+        measurements      : {name: ratio_value}
+        labels            : {name: description}
+        grade_label       : str  ("DIVINE GEOMETRY", etc.)
+    """
+
+    def pt(name):
+        idx = LM.get(name)
+        if idx is None or idx >= len(landmarks):
+            return None
+        lm = landmarks[idx]
+        return (lm.x * img_w, lm.y * img_h)
+
+    # ── Gather key points ────────────────────────────────────────────────────
+    forehead      = pt("forehead")
+    chin          = pt("chin")
+    left_cheek    = pt("left_cheek")
+    right_cheek   = pt("right_cheek")
+    l_eye_out     = pt("left_eye_outer")
+    r_eye_out     = pt("right_eye_outer")
+    l_eye_in      = pt("left_eye_inner")
+    r_eye_in      = pt("right_eye_inner")
+    l_nostril     = pt("left_nostril")
+    r_nostril     = pt("right_nostril")
+    mouth_l       = pt("mouth_left")
+    mouth_r       = pt("mouth_right")
+    nose_tip      = pt("nose_tip")
+
+    # ── Distances ────────────────────────────────────────────────────────────
+    face_len      = _dist(forehead, chin)
+    face_wid      = _dist(left_cheek, right_cheek)
+    outer_eye     = _dist(l_eye_out, r_eye_out)
+    inner_eye     = _dist(l_eye_in, r_eye_in)
+    nose_wid      = _dist(l_nostril, r_nostril)
+    mouth_wid     = _dist(mouth_l, mouth_r)
+    nose_to_chin  = _dist(nose_tip, chin)
+
+    measurements  = {}
+    scores        = {}
+    labels        = {}
+
+    # ── Measurement 1: Face Length / Face Width → ideal: φ ──────────────────
+    # A "golden" face is 1.618× taller than wide (cheek to cheek).
+    if face_wid > 5:
+        r = face_len / face_wid
+        measurements["Face Proportion"]  = round(r, 4)
+        scores["Face Proportion"]        = _ratio_score(r)
+        labels["Face Proportion"]        = "Face Height / Face Width"
+
+    # ── Measurement 2: Outer Eye Dist / Inner Eye Dist → ideal: φ ────────────
+    # The outer eye span should be φ× the inner (between-eyes) gap.
+    if inner_eye > 5:
+        r = outer_eye / inner_eye
+        measurements["Eye Spacing"]      = round(r, 4)
+        scores["Eye Spacing"]            = _ratio_score(r)
+        labels["Eye Spacing"]            = "Outer Eye Span / Inner Eye Gap"
+
+    # ── Measurement 3: Mouth Width / Nose Width → ideal: φ ───────────────────
+    # The mouth should be φ× wider than the nose.
+    if nose_wid > 5:
+        r = mouth_wid / nose_wid
+        measurements["Mouth / Nose"]     = round(r, 4)
+        scores["Mouth / Nose"]           = _ratio_score(r)
+        labels["Mouth / Nose"]           = "Mouth Width / Nose Width"
+
+    # ── Measurement 4: Face Width / Outer Eye Distance → ideal: φ ────────────
+    # Face width (cheek-to-cheek) should be φ× the outer eye span.
+    if outer_eye > 5:
+        r = face_wid / outer_eye
+        measurements["Face / Eye Width"] = round(r, 4)
+        scores["Face / Eye Width"]       = _ratio_score(r)
+        labels["Face / Eye Width"]       = "Face Width / Outer Eye Span"
+
+    # ── Measurement 5: Upper Face / Lower Face → ideal: φ ────────────────────
+    # Forehead-to-nose-tip / nose-tip-to-chin ≈ φ
+    upper_face = _dist(forehead, nose_tip)
+    if nose_to_chin > 5 and upper_face > 5:
+        r = upper_face / nose_to_chin
+        measurements["Upper / Lower"]    = round(r, 4)
+        scores["Upper / Lower"]          = _ratio_score(r)
+        labels["Upper / Lower"]          = "Forehead-to-Nose / Nose-to-Chin"
+
+    # ── Overall score ─────────────────────────────────────────────────────────
+    overall = round(sum(scores.values()) / len(scores), 2) if scores else 0.0
+
+    # ── Grade label ───────────────────────────────────────────────────────────
+    if overall >= 90:
+        grade = "DIVINE GEOMETRY"
+    elif overall >= 78:
+        grade = "GOLDEN HARMONY"
+    elif overall >= 64:
+        grade = "BALANCED FORM"
+    elif overall >= 50:
+        grade = "DEVELOPING SYMMETRY"
+    else:
+        grade = "UNIQUE ASYMMETRY"
+
+    return {
+        "overall_score":      overall,
+        "individual_scores":  scores,
+        "measurements":       measurements,
+        "labels":             labels,
+        "grade_label":        grade,
+        "phi":                PHI,
+    }
+```
+
+---
+
+### 4.6 `renderer.py`
+
+```python
+# renderer.py
+# ─── Pygame-based UI renderer ─────────────────────────────────────────────────
+#
+# All drawing happens here. The main application passes state data in; this
+# module only renders — it never modifies application state.
+#
+# Visual design:
+#   Background : Deep navy/black  (#06 08 12)
+#   Primary    : Electric cyan    (#00 D2 FF)
+#   Accent     : Gold             (#FF C4 28)
+#   Success    : Mint green       (#00 E6 6E)
+#   Warning    : Amber            (#FF A0 14)
+#   Error      : Soft red         (#FF 37 37)
+
+import os
+import math
+import time
+import pygame
+import numpy as np
+import cv2
+
+from config import (
+    C_BG, C_PANEL_BG, C_CYAN, C_CYAN_DIM, C_CYAN_MID,
+    C_GOLD, C_GOLD_DIM, C_WHITE, C_GREEN, C_AMBER, C_RED,
+    C_GRID, C_SEPARATOR, FONT_DIR,
+    DISPLAY_WIDTH, DISPLAY_HEIGHT, TARGET_FPS,
+    PHI
+)
+from detector import DRAW_CONNECTIONS, IRIS_CONNECTIONS
+
+
+# ─── State constants (must match main.py) ─────────────────────────────────────
+S_IDLE      = "IDLE"
+S_DETECTED  = "FACE_DETECTED"
+S_SCANNING  = "SCANNING"
+S_RESULT    = "RESULT"
+S_COOLDOWN  = "COOLDOWN"
+S_NO_CAM    = "NO_CAMERA"
+
+
+def _score_color(score: float):
+    if score >= 75:
+        return C_GREEN
+    elif score >= 50:
+        return C_AMBER
+    else:
+        return C_RED
+
+
+def _draw_line_alpha(surface, color_rgb, alpha, pt1, pt2, width=1):
+    """Draw a line with per-pixel alpha onto a SRCALPHA surface."""
+    pygame.draw.line(surface, (*color_rgb, alpha), pt1, pt2, width)
+
+
+def _draw_rect_alpha(surface, color_rgb, alpha, rect):
+    pygame.draw.rect(surface, (*color_rgb, alpha), rect)
+
+
+class Renderer:
+
+    def __init__(self):
+        pygame.init()
+        pygame.display.set_caption("FACIAL GOLDEN RATIO SCANNER")
+        pygame.mouse.set_visible(False)
+
+        # Detect screen resolution
+        info = pygame.display.Info()
+        sw = DISPLAY_WIDTH  if DISPLAY_WIDTH  > 0 else info.current_w
+        sh = DISPLAY_HEIGHT if DISPLAY_HEIGHT > 0 else info.current_h
+        self.sw, self.sh = sw, sh
+
+        self.screen = pygame.display.set_mode(
+            (sw, sh), pygame.FULLSCREEN | pygame.HWSURFACE | pygame.DOUBLEBUF
+        )
+        self.clock = pygame.time.Clock()
+
+        # ── Layout ────────────────────────────────────────────────────────────
+        # Camera area: left 72% | Panel: right 28%
+        self.cam_w   = int(sw * 0.72)
+        self.cam_h   = sh
+        self.panel_x = self.cam_w
+        self.panel_w = sw - self.cam_w
+
+        # Surfaces
+        self.overlay = pygame.Surface((self.cam_w, self.cam_h), pygame.SRCALPHA)
+        self.panel   = pygame.Surface((self.panel_w, sh), pygame.SRCALPHA)
+
+        # Font loading
+        self._load_fonts()
+
+        # Animation state
+        self.phase      = 0.0   # Global animation phase (radians)
+        self.disp_score = 0.0   # Animated display score (counts up to target)
+
+        # Camera projection values (set in _render_frame)
+        self.cam_scale = 1.0
+        self.cam_off_x = 0
+        self.cam_off_y = 0
+        self.cam_src_w = 640
+        self.cam_src_h = 480
+
+    # ── Font loading ───────────────────────────────────────────────────────────
+
+    def _load_fonts(self):
+        orb_r = os.path.join(FONT_DIR, "Orbitron-Regular.ttf")
+        orb_b = os.path.join(FONT_DIR, "Orbitron-Bold.ttf")
+
+        def orb(size, bold=False):
+            path = orb_b if bold else orb_r
+            if os.path.isfile(path):
+                return pygame.font.Font(path, size)
+            # Fallback to a system monospace font
+            return pygame.font.SysFont("dejavusansmono", size, bold=bold)
+
+        self.f_huge   = orb(52, bold=True)
+        self.f_large  = orb(34, bold=True)
+        self.f_title  = orb(22, bold=True)
+        self.f_medium = orb(17)
+        self.f_small  = orb(13)
+        self.f_tiny   = orb(11)
+
+    # ── Main update ────────────────────────────────────────────────────────────
+
+    def update(self, frame, detection, state, scan_progress,
+               result_data, face_hold_progress):
+        """
+        Called once per game loop iteration.
+        frame              : BGR np.ndarray from the camera (or None)
+        detection          : dict from FaceDetector.process()
+        state              : current app state string
+        scan_progress      : float 0–1 for scan animation
+        result_data        : dict from analyzer.analyze() or None
+        face_hold_progress : float 0–1, how long face has been held steady
+        """
+        self.phase = (self.phase + 0.04) % (2 * math.pi)
+
+        # Animate score counter toward target
+        if result_data:
+            target = result_data["overall_score"]
+            self.disp_score = min(target, self.disp_score + max(0.6, (target - self.disp_score) * 0.08))
+        else:
+            self.disp_score = 0.0
+
+        # ── Background ────────────────────────────────────────────────────────
+        self.screen.fill(C_BG)
+        self._draw_grid()
+
+        # ── Camera feed ───────────────────────────────────────────────────────
+        if frame is not None:
+            self._render_frame(frame)
+
+        # ── Overlay on camera area ────────────────────────────────────────────
+        self.overlay.fill((0, 0, 0, 0))
+
+        if detection and detection["face_detected"]:
+            lms     = detection["landmarks"]
+            img_w   = detection["img_w"]
+            img_h   = detection["img_h"]
+
+            if state == S_SCANNING:
+                self._draw_mesh_reveal(lms, img_w, img_h, scan_progress)
+            elif state in (S_RESULT, S_COOLDOWN):
+                self._draw_mesh_full(lms, img_w, img_h, result_data)
+            else:
+                self._draw_mesh_dots(lms, img_w, img_h, alpha=60)
+
+            self._draw_bbox(detection, state, face_hold_progress)
+
+        if state == S_SCANNING:
+            self._draw_scanline(scan_progress)
+
+        self.screen.blit(self.overlay, (0, 0))
+
+        # ── Screen decorations ────────────────────────────────────────────────
+        self._draw_corner_brackets()
+        self._draw_panel(state, result_data)
+        self._draw_status_bar(state)
+
+        pygame.display.flip()
+        self.clock.tick(TARGET_FPS)
+
+    # ── Frame rendering ────────────────────────────────────────────────────────
+
+    def _render_frame(self, frame):
+        h, w = frame.shape[:2]
+        scale = min(self.cam_w / w, self.cam_h / h)
+        dw = int(w * scale)
+        dh = int(h * scale)
+        off_x = (self.cam_w - dw) // 2
+        off_y = (self.cam_h - dh) // 2
+
+        # Store projection values for landmark mapping
+        self.cam_scale = scale
+        self.cam_off_x = off_x
+        self.cam_off_y = off_y
+        self.cam_src_w = w
+        self.cam_src_h = h
+
+        resized = cv2.resize(frame, (dw, dh), interpolation=cv2.INTER_LINEAR)
+        rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        surf    = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+        self.screen.blit(surf, (off_x, off_y))
+
+    # ── Landmark projection ────────────────────────────────────────────────────
+
+    def _proj(self, lm):
+        """Project a MediaPipe landmark to screen pixel coordinates."""
+        x = int(lm.x * self.cam_src_w * self.cam_scale) + self.cam_off_x
+        y = int(lm.y * self.cam_src_h * self.cam_scale) + self.cam_off_y
+        return (x, y)
+
+    # ── Face mesh drawing ──────────────────────────────────────────────────────
+
+    def _draw_mesh_dots(self, lms, img_w, img_h, alpha=80):
+        """Draw just the 468 landmark dots (dim, for detected state)."""
+        color = (*C_CYAN, alpha)
+        for lm in lms:
+            pt = self._proj(lm)
+            pygame.draw.circle(self.overlay, color, pt, 1)
+
+    def _draw_mesh_reveal(self, lms, img_w, img_h, progress):
+        """
+        Progressive mesh reveal as scan line sweeps downward.
+        Connections above the scan line are visible; below are ghosted.
+        """
+        scan_y = int(progress * self.cam_h)
+
+        # Draw contour connections
+        for conn in DRAW_CONNECTIONS:
+            conn_l = list(conn)
+            if len(conn_l) != 2:
+                continue
+            pt1 = self._proj(lms[conn_l[0]])
+            pt2 = self._proj(lms[conn_l[1]])
+            avg_y = (pt1[1] + pt2[1]) / 2
+
+            if avg_y <= scan_y:
+                # Revealed — full brightness with inner glow
+                pygame.draw.line(self.overlay, (*C_CYAN, 20), pt1, pt2, 3)
+                pygame.draw.line(self.overlay, (*C_CYAN, 160), pt1, pt2, 1)
+            else:
+                # Not yet revealed — very dim
+                pygame.draw.line(self.overlay, (*C_CYAN, 12), pt1, pt2, 1)
+
+        # Highlight dots near the scan line
+        for lm in lms:
+            pt = self._proj(lm)
+            dist_from_scan = abs(pt[1] - scan_y)
+            if dist_from_scan < 25:
+                brightness = int(255 * (1.0 - dist_from_scan / 25))
+                pygame.draw.circle(self.overlay, (*C_WHITE, brightness), pt, 2)
+            elif pt[1] <= scan_y:
+                pygame.draw.circle(self.overlay, (*C_CYAN, 180), pt, 1)
+
+        # Draw iris connections brighter
+        for conn in IRIS_CONNECTIONS:
+            conn_l = list(conn)
+            if len(conn_l) != 2:
+                continue
+            pt1 = self._proj(lms[conn_l[0]])
+            pt2 = self._proj(lms[conn_l[1]])
+            if (pt1[1] + pt2[1]) / 2 <= scan_y:
+                pygame.draw.line(self.overlay, (*C_CYAN, 230), pt1, pt2, 1)
+
+    def _draw_mesh_full(self, lms, img_w, img_h, result_data):
+        """Full mesh display during result state, colored by score."""
+        score = result_data["overall_score"] if result_data else 50
+        # Lerp between cyan (low score) and green (high score)
+        t   = max(0.0, min(1.0, (score - 40) / 60))  # 0 at 40%, 1 at 100%
+        r   = int(C_CYAN[0] + t * (C_GREEN[0] - C_CYAN[0]))
+        g   = int(C_CYAN[1] + t * (C_GREEN[1] - C_CYAN[1]))
+        b   = int(C_CYAN[2] + t * (C_GREEN[2] - C_CYAN[2]))
+        mesh_color = (r, g, b)
+
+        for conn in DRAW_CONNECTIONS:
+            conn_l = list(conn)
+            if len(conn_l) != 2:
+                continue
+            pt1 = self._proj(lms[conn_l[0]])
+            pt2 = self._proj(lms[conn_l[1]])
+            pygame.draw.line(self.overlay, (*mesh_color, 18), pt1, pt2, 3)
+            pygame.draw.line(self.overlay, (*mesh_color, 160), pt1, pt2, 1)
+
+        for lm in lms:
+            pt = self._proj(lm)
+            pygame.draw.circle(self.overlay, (*mesh_color, 200), pt, 1)
+
+        for conn in IRIS_CONNECTIONS:
+            conn_l = list(conn)
+            if len(conn_l) == 2:
+                pt1 = self._proj(lms[conn_l[0]])
+                pt2 = self._proj(lms[conn_l[1]])
+                pygame.draw.line(self.overlay, (*C_GOLD, 220), pt1, pt2, 2)
+
+    # ── Bounding box ───────────────────────────────────────────────────────────
+
+    def _draw_bbox(self, detection, state, hold_progress):
+        bb = detection["bbox"]
+        if not bb:
+            return
+        x1, y1, x2, y2 = bb
+        scale  = self.cam_scale
+        off_x  = self.cam_off_x
+        off_y  = self.cam_off_y
+        sx1    = int(x1 * scale) + off_x
+        sy1    = int(y1 * scale) + off_y
+        sx2    = int(x2 * scale) + off_x
+        sy2    = int(y2 * scale) + off_y
+
+        pulse  = int(160 + 80 * math.sin(self.phase * 2))
+        clen   = max(20, min(40, (sx2 - sx1) // 5))
+        thick  = 2
+        color  = (*C_GOLD, pulse) if state == S_RESULT else (*C_CYAN, pulse)
+
+        def corner(ax, ay, dx, dy):
+            pygame.draw.line(self.overlay, color, (ax, ay), (ax + dx * clen, ay), thick)
+            pygame.draw.line(self.overlay, color, (ax, ay), (ax, ay + dy * clen), thick)
+
+        corner(sx1, sy1,  1,  1)
+        corner(sx2, sy1, -1,  1)
+        corner(sx1, sy2,  1, -1)
+        corner(sx2, sy2, -1, -1)
+
+        # Hold progress arc around face center
+        if state == S_DETECTED and hold_progress > 0:
+            cx = (sx1 + sx2) // 2
+            cy = (sy1 + sy2) // 2
+            radius = max(50, (sx2 - sx1) // 2 + 20)
+            end_angle = int(360 * hold_progress)
+            rect = pygame.Rect(cx - radius, cy - radius, radius * 2, radius * 2)
+            pygame.draw.arc(self.overlay, (*C_GOLD, 200), rect,
+                            math.radians(90),
+                            math.radians(90 + end_angle), 3)
+
+    # ── Scan line ──────────────────────────────────────────────────────────────
+
+    def _draw_scanline(self, progress):
+        y = int(progress * self.cam_h)
+        # Glow layers (wide → narrow, transparent → opaque)
+        for width, alpha in ((30, 6), (14, 18), (6, 45), (2, 140)):
+            top = max(0, y - width // 2)
+            _draw_rect_alpha(self.overlay, C_CYAN, alpha,
+                             (0, top, self.cam_w, width))
+        # Core bright line
+        pygame.draw.rect(self.overlay, (*C_WHITE, 220), (0, y, self.cam_w, 1))
+        # Small horizontal tick marks along the scan line
+        for x in range(0, self.cam_w, 40):
+            pygame.draw.line(self.overlay, (*C_WHITE, 80),
+                             (x, y - 4), (x, y + 4), 1)
+
+    # ── Background grid ────────────────────────────────────────────────────────
+
+    def _draw_grid(self):
+        step = 72
+        for x in range(0, self.sw, step):
+            pygame.draw.line(self.screen, C_GRID, (x, 0), (x, self.sh), 1)
+        for y in range(0, self.sh, step):
+            pygame.draw.line(self.screen, C_GRID, (0, y), (self.sw, y), 1)
+
+    # ── Screen corner brackets ─────────────────────────────────────────────────
+
+    def _draw_corner_brackets(self):
+        size = 28
+        mg   = 14
+        color = C_CYAN_MID
+        thick = 1
+        pts = [
+            ((mg, mg),             ( 1,  1)),
+            ((self.sw - mg, mg),   (-1,  1)),
+            ((mg, self.sh - mg),   ( 1, -1)),
+            ((self.sw - mg, self.sh - mg), (-1, -1)),
+        ]
+        for (cx, cy), (dx, dy) in pts:
+            pygame.draw.line(self.screen, color, (cx, cy), (cx + dx * size, cy), thick)
+            pygame.draw.line(self.screen, color, (cx, cy), (cx, cy + dy * size), thick)
+
+    # ── Status bar ─────────────────────────────────────────────────────────────
+
+    def _draw_status_bar(self, state):
+        messages = {
+            S_IDLE:     "SCANNING FOR SUBJECT",
+            S_DETECTED: "SUBJECT ACQUIRED — HOLD STILL",
+            S_SCANNING: "ANALYZING FACIAL GEOMETRY",
+            S_RESULT:   "ANALYSIS COMPLETE",
+            S_COOLDOWN: "READY FOR NEXT SCAN",
+            S_NO_CAM:   "CAMERA UNAVAILABLE",
+        }
+        text  = messages.get(state, state)
+        pulse = 0.5 + 0.5 * math.sin(self.phase * 1.5)
+
+        if state == S_RESULT:
+            color = C_GOLD
+            alpha = 255
+        elif state == S_NO_CAM:
+            color = C_RED
+            alpha = 255
+        else:
+            color = C_CYAN
+            alpha = int(160 + 95 * pulse) if state in (S_IDLE, S_DETECTED) else 255
+
+        surf = self.f_medium.render(text, True, color)
+        surf.set_alpha(alpha)
+        x = (self.cam_w - surf.get_width()) // 2
+        y = self.sh - 44
+
+        # Background pill
+        bg = pygame.Surface((surf.get_width() + 28, 30), pygame.SRCALPHA)
+        bg.fill((0, 0, 0, 100))
+        self.screen.blit(bg, (x - 14, y - 3))
+        self.screen.blit(surf, (x, y))
+
+    # ── Side panel ─────────────────────────────────────────────────────────────
+
+    def _draw_panel(self, state, result_data):
+        px  = self.panel_x
+        pw  = self.panel_w
+        sh  = self.sh
+
+        # Panel background
+        panel_surf = pygame.Surface((pw, sh), pygame.SRCALPHA)
+        panel_surf.fill((*C_PANEL_BG, 235))
+        self.screen.blit(panel_surf, (px, 0))
+
+        # Left separator line
+        pygame.draw.line(self.screen, C_SEPARATOR, (px, 0), (px, sh), 1)
+
+        x = px + 18
+        y = 24
+
+        # ── Header ────────────────────────────────────────────────────────────
+        t = self.f_small.render("GOLDEN RATIO", True, C_CYAN)
+        self.screen.blit(t, (x, y)); y += t.get_height() + 4
+
+        t = self.f_tiny.render("FACIAL ANALYSIS SYSTEM", True, C_CYAN_MID)
+        self.screen.blit(t, (x, y)); y += t.get_height() + 10
+
+        pygame.draw.line(self.screen, C_SEPARATOR,
+                         (x, y), (px + pw - 18, y), 1); y += 14
+
+        # ── Phi symbol ────────────────────────────────────────────────────────
+        phi_surf = self.f_title.render("φ = 1.618033...", True, C_GOLD)
+        self.screen.blit(phi_surf, (x, y)); y += phi_surf.get_height() + 20
+
+        pygame.draw.line(self.screen, C_SEPARATOR,
+                         (x, y), (px + pw - 18, y), 1); y += 16
+
+        if result_data:
+            self._draw_results(result_data, x, y, pw)
+        else:
+            self._draw_idle_panel(x, y)
+
+    def _draw_idle_panel(self, x, y):
+        lines = ["AWAITING", "FACIAL DATA...", "", f"MEASUREMENTS: 5", f"TARGET RATIO: φ"]
+        for line in lines:
+            if line:
+                surf = self.f_small.render(line, True, C_CYAN_DIM)
+                self.screen.blit(surf, (x, y))
+            y += 26
+
+    def _draw_results(self, data, x, y, pw):
+        overall = self.disp_score         # animated counter
+        target  = data["overall_score"]
+        scores  = data["individual_scores"]
+        grade   = data["grade_label"]
+
+        bar_w   = pw - 36
+
+        # ── Overall score ──────────────────────────────────────────────────────
+        lbl = self.f_tiny.render("OVERALL SCORE", True, C_CYAN_MID)
+        self.screen.blit(lbl, (x, y)); y += lbl.get_height() + 6
+
+        sc = _score_color(target)
+        score_surf = self.f_huge.render(f"{overall:.1f}%", True, sc)
+        self.screen.blit(score_surf, (x, y)); y += score_surf.get_height() + 8
+
+        # Score bar
+        pygame.draw.rect(self.screen, C_CYAN_DIM, (x, y, bar_w, 7), border_radius=3)
+        fill = int(bar_w * min(1.0, overall / 100))
+        if fill > 0:
+            pygame.draw.rect(self.screen, sc, (x, y, fill, 7), border_radius=3)
+        y += 16
+
+        # Grade label
+        gl = self.f_small.render(grade, True, C_GOLD)
+        self.screen.blit(gl, (x, y)); y += gl.get_height() + 18
+
+        pygame.draw.line(self.screen, C_SEPARATOR,
+                         (x, y), (x + bar_w, y), 1); y += 14
+
+        # ── Individual measurements ────────────────────────────────────────────
+        detail = self.f_tiny.render("MEASUREMENT BREAKDOWN", True, C_CYAN_MID)
+        self.screen.blit(detail, (x, y)); y += detail.get_height() + 12
+
+        for name, score in scores.items():
+            if y > self.sh - 100:
+                break
+            sc2 = _score_color(score)
+
+            # Measurement name
+            name_surf = self.f_tiny.render(name.upper(), True, (140, 165, 185))
+            self.screen.blit(name_surf, (x, y))
+
+            # Score value (right-aligned)
+            pct_surf = self.f_tiny.render(f"{score:.0f}%", True, sc2)
+            self.screen.blit(pct_surf, (x + bar_w - pct_surf.get_width(), y))
+            y += name_surf.get_height() + 4
+
+            # Mini bar
+            pygame.draw.rect(self.screen, C_CYAN_DIM, (x, y, bar_w, 4), border_radius=2)
+            mfill = int(bar_w * score / 100)
+            if mfill > 0:
+                pygame.draw.rect(self.screen, sc2, (x, y, mfill, 4), border_radius=2)
+            y += 16
+
+        # ── Timestamp at bottom ────────────────────────────────────────────────
+        ts_y = self.sh - 55
+        if "timestamp" in data:
+            ts_surf = self.f_tiny.render(data["timestamp"], True, C_CYAN_DIM)
+            self.screen.blit(ts_surf, (x, ts_y))
+
+        # Scan count
+        if "scan_id" in data:
+            id_surf = self.f_tiny.render(f"SCAN #{data['scan_id']:04d}", True, C_CYAN_DIM)
+            self.screen.blit(id_surf, (x, ts_y + 16))
+
+    # ── Event handling ─────────────────────────────────────────────────────────
+
+    def poll_events(self):
+        return pygame.event.get()
+
+    def quit(self):
+        pygame.mouse.set_visible(True)
+        pygame.quit()
+```
+
+---
+
+### 4.7 `storage.py`
+
+```python
+# storage.py
+# ─── Saves scan results to Excel and JPEG images ──────────────────────────────
+
+import os
+import cv2
+import datetime
+import logging
+import openpyxl
+from openpyxl.styles import (Font, PatternFill, Alignment,
+                              Border, Side, GradientFill)
+from openpyxl.utils import get_column_letter
+
+log = logging.getLogger("storage")
+
+# Column definitions: (header text, width, is_score)
+COLUMNS = [
+    ("ID",                  6,   False),
+    ("Timestamp",          22,   False),
+    ("Image File",         36,   False),
+    ("Overall Score (%)",  18,   True ),
+    ("Grade",              22,   False),
+    ("Face Proportion",    18,   False),
+    ("Face Prop Score %",  18,   True ),
+    ("Eye Spacing",        16,   False),
+    ("Eye Spac Score %",   16,   True ),
+    ("Mouth / Nose",       16,   False),
+    ("Mouth/Nose Score %", 18,   True ),
+    ("Face / Eye Width",   18,   False),
+    ("Face/Eye Score %",   18,   True ),
+    ("Upper / Lower",      16,   False),
+    ("Upper/Low Score %",  18,   True ),
+]
+
+_MEAS_ORDER = [
+    "Face Proportion",
+    "Eye Spacing",
+    "Mouth / Nose",
+    "Face / Eye Width",
+    "Upper / Lower",
+]
+
+# Excel color palette (hex, no #)
+_HDR_FILL   = "030A1E"
+_HDR_FONT   = "00D2FF"
+_ROW_EVEN   = "060D22"
+_ROW_ODD    = "091326"
+_SCORE_HIGH = "00E66E"   # green
+_SCORE_MID  = "FFA014"   # amber
+_SCORE_LOW  = "FF3737"   # red
+
+
+class DataManager:
+
+    def __init__(self, excel_path: str, images_dir: str):
+        self.excel_path = excel_path
+        self.images_dir = images_dir
+        self._count     = 0
+
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(excel_path), exist_ok=True)
+        self._init_workbook()
+
+    # ── Init workbook ──────────────────────────────────────────────────────────
+
+    def _init_workbook(self):
+        if os.path.exists(self.excel_path):
+            try:
+                wb = openpyxl.load_workbook(self.excel_path)
+                ws = wb.active
+                self._count = max(0, ws.max_row - 1)
+                wb.close()
+                log.info("Loaded existing workbook (%d records)", self._count)
+                return
+            except Exception as e:
+                log.warning("Could not read existing workbook: %s — recreating", e)
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Face Scans"
+
+        hdr_fill  = PatternFill("solid", fgColor=_HDR_FILL)
+        hdr_font  = Font(color=_HDR_FONT, bold=True, name="Calibri", size=10)
+        hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        border_b  = Border(bottom=Side(border_style="thin", color="00A0C0"))
+
+        ws.row_dimensions[1].height = 32
+
+        for col_idx, (header, width, _) in enumerate(COLUMNS, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.fill   = hdr_fill
+            cell.font   = hdr_font
+            cell.alignment = hdr_align
+            cell.border = border_b
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+        ws.freeze_panes = "A2"
+        wb.save(self.excel_path)
+        log.info("Created workbook: %s", self.excel_path)
+
+    # ── Public: save a scan ────────────────────────────────────────────────────
+
+    def save(self, frame, analysis: dict,
+             timestamp: datetime.datetime = None) -> int:
+        """
+        Save JPEG image and append a row to the Excel file.
+        Returns the record ID.
+        """
+        if timestamp is None:
+            timestamp = datetime.datetime.now()
+
+        self._count += 1
+        scan_id = self._count
+
+        # Save image
+        ts_str   = timestamp.strftime("%Y%m%d_%H%M%S")
+        filename = f"scan_{ts_str}_{scan_id:04d}.jpg"
+        img_path = os.path.join(self.images_dir, filename)
+        cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+
+        # Append to Excel
+        try:
+            self._append_row(scan_id, timestamp, filename, analysis)
+        except Exception as exc:
+            log.error("Excel write failed: %s", exc)
+
+        log.info("Saved scan #%d — score=%.1f%%  file=%s",
+                 scan_id, analysis.get("overall_score", 0), filename)
+        return scan_id
+
+    # ── Internal: append row ───────────────────────────────────────────────────
+
+    def _append_row(self, scan_id, ts, filename, analysis):
+        wb  = openpyxl.load_workbook(self.excel_path)
+        ws  = wb.active
+        row = ws.max_row + 1
+
+        overall   = analysis.get("overall_score", 0)
+        grade     = analysis.get("grade_label", "")
+        meas      = analysis.get("measurements", {})
+        scores    = analysis.get("individual_scores", {})
+
+        values = [
+            scan_id,
+            ts.strftime("%Y-%m-%d %H:%M:%S"),
+            filename,
+            round(overall, 2),
+            grade,
+        ]
+        for name in _MEAS_ORDER:
+            values.append(meas.get(name, ""))
+            values.append(round(scores.get(name, 0), 2) if scores.get(name) else "")
+
+        fill_color = _ROW_EVEN if row % 2 == 0 else _ROW_ODD
+        row_fill   = PatternFill("solid", fgColor=fill_color)
+        center_a   = Alignment(horizontal="center", vertical="center")
+
+        for col_idx, value in enumerate(values, 1):
+            _, _, is_score = COLUMNS[col_idx - 1]
+            cell = ws.cell(row=row, column=col_idx, value=value)
+            cell.fill      = row_fill
+            cell.alignment = center_a
+
+            if is_score and isinstance(value, (int, float)):
+                v = float(value)
+                if v >= 75:
+                    cell.font = Font(color=_SCORE_HIGH, bold=(col_idx == 4), name="Calibri")
+                elif v >= 50:
+                    cell.font = Font(color=_SCORE_MID, bold=(col_idx == 4), name="Calibri")
+                else:
+                    cell.font = Font(color=_SCORE_LOW, bold=(col_idx == 4), name="Calibri")
+            else:
+                cell.font = Font(color="C0D0E0", name="Calibri")
+
+        wb.save(self.excel_path)
+        wb.close()
+```
+
+---
+
+### 4.8 `main.py`
+
+```python
+# main.py
+# ─── Face Scanner — Main Application ─────────────────────────────────────────
+
+import os
+import sys
+import time
+import datetime
+import logging
+import pygame
+
+# ─── Ensure SDL2 can find the display before pygame init ──────────────────────
+# This handles both X11 and Wayland on Raspberry Pi OS.
+if "DISPLAY" not in os.environ and "WAYLAND_DISPLAY" not in os.environ:
+    # Running without a display server (e.g. console / SSH without X)
+    # Try KMS/DRM framebuffer — requires the user to be in the 'video' group.
+    os.environ.setdefault("SDL_VIDEODRIVER", "kmsdrm")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("main")
+
+from config import (
+    ESP32_STREAM_URL, STREAM_TIMEOUT_SEC,
+    FACE_HOLD_SECONDS, SCAN_DURATION_SEC,
+    RESULT_DISPLAY_SEC, COOLDOWN_SEC,
+    PROCESS_EVERY_N,
+    DETECTION_CONFIDENCE, TRACKING_CONFIDENCE,
+    EXCEL_FILE, IMAGES_DIR,
+)
+from stream   import ESP32Stream
+from detector import FaceDetector
+from analyzer import analyze
+from renderer import (Renderer,
+                      S_IDLE, S_DETECTED, S_SCANNING,
+                      S_RESULT, S_COOLDOWN, S_NO_CAM)
+from storage  import DataManager
+
+
+class FaceScanner:
+
+    def __init__(self):
+        log.info("Initializing Face Scanner...")
+
+        self.stream   = ESP32Stream(ESP32_STREAM_URL)
+        self.detector = FaceDetector(DETECTION_CONFIDENCE, TRACKING_CONFIDENCE)
+        self.renderer = Renderer()
+        self.storage  = DataManager(EXCEL_FILE, IMAGES_DIR)
+
+        # State
+        self.state              = S_NO_CAM
+        self.scan_progress      = 0.0
+        self.face_hold_start    = None
+        self.face_hold_progress = 0.0
+        self.scan_start         = None
+        self.result_start       = None
+        self.last_capture       = 0.0
+        self.result_data        = None
+        self.capture_frame      = None
+        self.last_detection     = None
+        self._frame_counter     = 0
+
+        log.info("Initialization complete.")
+
+    # ── Main entry point ───────────────────────────────────────────────────────
+
+    def run(self):
+        self.stream.start()
+        self._wait_for_stream()
+
+        try:
+            self._loop()
+        except KeyboardInterrupt:
+            log.info("Interrupted.")
+        finally:
+            self._shutdown()
+
+    def _wait_for_stream(self):
+        log.info("Waiting for ESP32-CAM stream at %s ...", ESP32_STREAM_URL)
+        deadline = time.monotonic() + STREAM_TIMEOUT_SEC
+        while not self.stream.is_alive:
+            if time.monotonic() > deadline:
+                log.warning("Stream not available yet — continuing anyway.")
+                return
+            time.sleep(0.3)
+        log.info("Stream connected.")
+
+    # ── Main loop ──────────────────────────────────────────────────────────────
+
+    def _loop(self):
+        running = True
+        while running:
+            # ── Event handling ─────────────────────────────────────────────────
+            for event in self.renderer.poll_events():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                        running = False
+                    elif event.key == pygame.K_r:
+                        self._reset()
+
+            # ── Capture frame ──────────────────────────────────────────────────
+            ok, frame = self.stream.read()
+
+            if not ok:
+                if self.state != S_NO_CAM:
+                    log.warning("Lost stream.")
+                    self.state = S_NO_CAM
+                self.renderer.update(None, None, self.state,
+                                     0.0, None, 0.0)
+                continue
+
+            if self.state == S_NO_CAM:
+                self.state = S_IDLE
+
+            # ── Run detection (every Nth frame for performance) ────────────────
+            self._frame_counter += 1
+            if self._frame_counter % PROCESS_EVERY_N == 0:
+                detection = self.detector.process(frame)
+                self.last_detection = detection
+            else:
+                detection = self.last_detection
+
+            # ── State machine ──────────────────────────────────────────────────
+            self._update_state(frame, detection)
+
+            # ── Render ────────────────────────────────────────────────────────
+            self.renderer.update(
+                frame,
+                detection,
+                self.state,
+                self.scan_progress,
+                self.result_data,
+                self.face_hold_progress,
+            )
+
+    # ── State machine ──────────────────────────────────────────────────────────
+
+    def _update_state(self, frame, detection):
+        now         = time.monotonic()
+        has_face    = detection is not None and detection["face_detected"]
+
+        if self.state == S_IDLE:
+            if has_face:
+                self.state           = S_DETECTED
+                self.face_hold_start = now
+                self.face_hold_progress = 0.0
+
+        elif self.state == S_DETECTED:
+            if not has_face:
+                self.state = S_IDLE
+                self.face_hold_start = None
+                self.face_hold_progress = 0.0
+                return
+            held = now - self.face_hold_start
+            self.face_hold_progress = min(1.0, held / FACE_HOLD_SECONDS)
+            if held >= FACE_HOLD_SECONDS:
+                # Trigger scan
+                self.state           = S_SCANNING
+                self.scan_start      = now
+                self.scan_progress   = 0.0
+                self.capture_frame   = frame.copy()   # save frame for analysis
+
+        elif self.state == S_SCANNING:
+            elapsed            = now - self.scan_start
+            self.scan_progress = min(1.0, elapsed / SCAN_DURATION_SEC)
+            if self.scan_progress >= 1.0:
+                self._run_analysis()   # transitions to S_RESULT
+
+        elif self.state == S_RESULT:
+            if now - self.result_start >= RESULT_DISPLAY_SEC:
+                self.state = S_COOLDOWN
+
+        elif self.state == S_COOLDOWN:
+            if now - self.last_capture >= COOLDOWN_SEC:
+                self._reset()
+
+    # ── Analysis ───────────────────────────────────────────────────────────────
+
+    def _run_analysis(self):
+        now = time.monotonic()
+        log.info("Running golden ratio analysis...")
+
+        if self.capture_frame is None:
+            self._reset(); return
+
+        cap_det = self.detector.process(self.capture_frame)
+        if not cap_det["face_detected"]:
+            log.warning("No face in captured frame — skipping save.")
+            self._reset(); return
+
+        result = analyze(
+            cap_det["landmarks"],
+            cap_det["img_w"],
+            cap_det["img_h"],
+        )
+
+        ts       = datetime.datetime.now()
+        scan_id  = self.storage.save(self.capture_frame, result, ts)
+
+        result["timestamp"] = ts.strftime("%Y-%m-%d  %H:%M:%S")
+        result["scan_id"]   = scan_id
+
+        self.result_data   = result
+        self.last_capture  = now
+        self.result_start  = now
+        self.state         = S_RESULT
+
+        log.info("Analysis done — scan #%d, overall=%.1f%% (%s)",
+                 scan_id, result["overall_score"], result["grade_label"])
+
+    # ── Reset ──────────────────────────────────────────────────────────────────
+
+    def _reset(self):
+        self.state              = S_IDLE
+        self.scan_progress      = 0.0
+        self.face_hold_start    = None
+        self.face_hold_progress = 0.0
+        self.scan_start         = None
+        self.result_data        = None
+        self.capture_frame      = None
+
+    # ── Shutdown ───────────────────────────────────────────────────────────────
+
+    def _shutdown(self):
+        log.info("Shutting down...")
+        self.stream.stop()
+        self.detector.close()
+        self.renderer.quit()
+        log.info("Done.")
+
+
+if __name__ == "__main__":
+    FaceScanner().run()
+```
+
+---
+
+## Part 5: Running the Application
+
+### 5.1 Update the ESP32 IP in config.py
+
+Open `~/face_scanner/config.py` and change:
+
+```python
+ESP32_IP = "192.168.1.105"   # Replace with the IP from Arduino Serial Monitor
+```
+
+### 5.2 Create `run.sh`
+
+```bash
+cat > ~/face_scanner/run.sh << 'EOF'
+#!/bin/bash
+set -e
+cd /home/$(whoami)/face_scanner
+source venv/bin/activate
+
+echo "Starting Face Scanner..."
+python main.py
+EOF
+
+chmod +x ~/face_scanner/run.sh
+```
+
+### 5.3 Run
+
+Make sure you are at the RPi desktop (HDMI display connected, logged in), then:
+
+```bash
+cd ~/face_scanner
+source venv/bin/activate
+python main.py
+```
+
+Or use the script:
+
+```bash
+~/face_scanner/run.sh
+```
+
+**Key bindings while running:**
+- `ESC` or `Q` — quit cleanly
+- `R` — manually reset the scanner to idle state
+
+### 5.4 First Run Checklist
+
+Power on the ESP32-CAM via its USB adapter first and confirm it is on the network (ping its IP from the RPi):
+
+```bash
+ping -c 4 192.168.1.105   # use your actual IP
+```
+
+Confirm the stream is accessible:
+
+```bash
+curl --max-time 5 "http://192.168.1.105:81/stream" -o /dev/null -w "%{http_code}"
+# Should return 200
+```
+
+---
+
+## Part 6: Autostart on Boot
+
+If you want the face scanner to start automatically when the RPi boots into the desktop:
+
+### Method: Systemd User Service
+
+```bash
+mkdir -p ~/.config/systemd/user/
+
+cat > ~/.config/systemd/user/face-scanner.service << EOF
+[Unit]
+Description=Face Scanner Golden Ratio Analyzer
+After=graphical-session.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/%i/face_scanner
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/%i/.Xauthority
+ExecStartPre=/bin/sleep 8
+ExecStart=/home/%i/face_scanner/venv/bin/python /home/%i/face_scanner/main.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Enable and start
+systemctl --user enable face-scanner.service
+systemctl --user start face-scanner.service
+
+# Check status
+systemctl --user status face-scanner.service
+```
+
+The 8-second `ExecStartPre` delay gives the desktop and network time to initialize before the app launches.
+
+To disable autostart: `systemctl --user disable face-scanner.service`
+
+---
+
+## Part 7: Data Storage Details
+
+Every scan produces two outputs:
+
+**JPEG image** saved to `~/face_scanner/data/images/scan_YYYYMMDD_HHMMSS_NNNN.jpg` at 92% quality. The filename encodes the timestamp and sequential scan ID.
+
+**Excel row** appended to `~/face_scanner/data/face_scans.xlsx` with these columns:
+
+```
+ID | Timestamp | Image File | Overall Score (%) | Grade |
+Face Proportion | Face Prop Score % |
+Eye Spacing | Eye Spac Score % |
+Mouth / Nose | Mouth/Nose Score % |
+Face / Eye Width | Face/Eye Score % |
+Upper / Lower | Upper/Low Score %
+```
+
+Score cells are color-coded: green ≥75%, amber ≥50%, red <50%.
+
+To open the Excel file from the RPi desktop, double-click it in Files (it opens in LibreOffice Calc), or copy it to another machine. To install LibreOffice if not present:
+
+```bash
+sudo apt install -y libreoffice-calc
+```
+
+---
+
+## Part 8: Troubleshooting
+
+**"Stream not available" / nothing appears on camera area**
+Run `curl http://YOUR_ESP32_IP:81/stream -v` on the RPi. If it hangs, the ESP32 is not reachable. Check: both devices on 2.4GHz WiFi, same subnet, ESP32 is powered on and the Serial Monitor showed the stream URL.
+
+**MediaPipe not found or import error**
+```bash
+source ~/face_scanner/venv/bin/activate
+pip install mediapipe --upgrade
+python -c "import mediapipe; print(mediapipe.__version__)"
+```
+
+**Pygame "no video target" / SDL error**
+You are likely running from SSH without forwarding the display. Either use the RPi desktop terminal directly, or over SSH with: `DISPLAY=:0 python main.py`
+
+**Very slow frame rate (below 5 FPS)**
+Increase `PROCESS_EVERY_N` in `config.py` from 2 to 3 or 4. This reduces how often MediaPipe runs and keeps the UI smooth. The trade-off is slightly delayed detection response.
+
+**Face mesh looks mirrored vs. actual face**
+Set `s->set_hmirror(s, 1)` in the Arduino sketch and re-flash. This is camera-dependent.
+
+**Excel file grows very large over time**
+The image files are the primary storage consumer, not the Excel file. To manage disk space, add a cleanup step periodically: `find ~/face_scanner/data/images -name "*.jpg" -mtime +30 -delete` removes images older than 30 days.
+
+**"FACEMESH_CONTOURS not found" warning in log**
+Your MediaPipe version uses a different attribute name. In `detector.py`, the code falls back to no connections and only renders dots. Upgrade mediapipe: `pip install mediapipe --upgrade`
