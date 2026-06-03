@@ -1,0 +1,5 @@
+[ESP32-CAM] Face Scanner Stream Server
+[OK] Camera initialized
+[WiFi] Connecting.......
+[OK] WiFi connected: 192.168.1.103
+[OK] Stream ready: http://192.168.1.103:81/stream
